@@ -1,0 +1,454 @@
+app:
+  name: "Zephyros L2 Trading Bot"
+  env: "dev"
+  log_level: "INFO"
+  symbols_override_path: "config/symbols.local.yaml"
+  database_path: "data/trades.db"
+  risk_state_path: "data/risk_state.json"
+  dev_mode: true
+  test_trade_close_sec: 5
+  window:
+    title: "Zephyros — L2 Trading Bot"
+    width: 1600
+    height: 900
+    min_width: 1200
+    min_height: 700
+    start_maximized: false
+
+synthetic:
+  enabled: false
+  symbol: "XAUUSD"
+  base_price: 2650.00
+
+data_pipeline:
+  storage_mode: "local"
+  local:
+    db_path: "data/l2_history.db"
+    retention_hours: 24
+    flush_interval_sec: 5
+    janitor_interval_sec: 300
+    warmup_seconds: 300
+    snapshot_throttle_ms: 1000
+    vacuum_on_start: false
+  vps:
+    api_url: ""
+    api_key: ""
+    warmup_seconds: 300
+
+symbols:
+  - id: "BTC"
+    display: "BTC/USD"
+    enabled: true
+    source: "binance"
+    binance: "BTCUSDT"
+    ctrader: null
+    mt5: "BTCUSDm"
+    price_decimals: 2
+    qty_decimals: 2
+    tick_size: 0.01
+    min_volume: 0.01
+    max_volume: 50.0
+    volume_step: 0.01
+
+  - id: "XAUUSD"
+    display: "XAU/USD"
+    enabled: true
+    source: "ctrader"
+    binance: null
+    ctrader: "XAUUSD"
+    mt5: "XAUUSDm"
+    price_decimals: 2
+    qty_decimals: 2
+    tick_size: 0.01
+    min_volume: 0.01
+    max_volume: 100.0
+    volume_step: 0.01
+
+feeds:
+  binance:
+    enabled: true
+    rest_base: "https://api.binance.com"
+    ws_base: "wss://stream.binance.com:9443"
+    depth_stream_speed_ms: 100
+    depth_snapshot_limit: 1000
+    reconnect:
+      initial_ms: 1000
+      max_ms: 30000
+      multiplier: 2.0
+  klines:
+    enabled: true
+    interval: "1m"
+    history_limit: 100
+    reconnect:
+      initial_ms: 1000
+      max_ms: 30000
+      multiplier: 2.0
+  ctrader:
+    enabled: true
+    account_id: 46392531
+    symbol_id_xauusd: 41
+    environment: "live"
+    host: "live.ctraderapi.com"
+    port: 5035
+    heartbeat_sec: 10
+    reconnect_initial_ms: 1000
+    reconnect_max_ms: 30000
+    infer_trade_side: true
+
+book:
+  publish_hz: 10
+  levels_to_keep: 1000
+  resync_on_gap: true
+  staleness_timeout_ms: 5000
+
+tape:
+  buffer_size: 10000
+  publish_hz: 10
+  large_trade_threshold:
+    BTC: 5.0
+
+ticker:
+  cvd_window_sec: 60
+  imbalance_levels: 5
+
+ui:
+  layout:
+    content_margins: 12
+    content_spacing: 12
+    panel_padding: 16
+    panel_radius: 8
+    panel_header_height: 32
+    panel_shadow: true
+
+  sidebar:
+    collapsed_width: 56
+    expanded_width: 220
+    pinned_by_default: true
+    items:
+      - id: "dashboard"
+        icon: "⊞"
+        label: "Dashboard"
+        order: 1
+      - id: "chart"
+        icon: "◴"
+        label: "Chart"
+        order: 2
+      - id: "debug"
+        icon: "◆"
+        label: "Debug"
+        order: 3
+      - id: "journal"
+        icon: "▤"
+        label: "Journal"
+        order: 4
+      - id: "risk"
+        icon: "◈"
+        label: "Risk"
+        order: 5
+      - id: "symbols"
+        icon: "⚙"
+        label: "Symbols"
+        order: 6
+    footer_items:
+      - id: "settings"
+        icon: "⚙"
+        label: "Settings"
+      - id: "about"
+        icon: "ⓘ"
+        label: "About"
+
+  ribbon:
+    height: 52
+    brand: "L2 · Bot"
+    brand_tooltip: "L2 Trading Bot"
+    hide_trading_on_pages: ["symbols"]
+
+  drawer:
+    collapsed_height: 32
+    expanded_height: 180
+    expanded_by_default: false
+    title: "EVENT STREAM"
+
+  grid:
+    cols: 6
+    rows: 6
+    gap: 8
+    padding: 8
+    row_weights: [1, 1, 1, 1, 1, 1]
+
+  widgets:
+    orderbook:
+      title: "Order Book"
+      enabled: true
+      levels_to_show: 20
+      price_decimals: 2
+      qty_decimals: 2
+      position: { row: 0, col: 0, row_span: 6, col_span: 1 }
+    tape:
+      title: "Time & Sales"
+      enabled: true
+      rows_to_show: 50
+      price_decimals: 2
+      qty_decimals: 2
+      position: { row: 0, col: 1, row_span: 6, col_span: 1 }
+    liquidity_heatmap:
+      title: "Liquidity Heatmap"
+      enabled: true
+      history_sec: 60.0
+      record_interval_ms: 100
+      levels: 1000
+      y_range_pct: 0.005 # ±0.5% (was 0.001)
+      fade_factor: 0.35 # how much old data dims
+      trade_dot_size: 2
+      position: { row: 0, col: 2, row_span: 4, col_span: 4 }
+    positions:
+      title: "Open Positions"
+      enabled: true
+      position: { row: 4, col: 2, row_span: 2, col_span: 2 }
+    signals:
+      title: "Signals"
+      enabled: true
+      position: { row: 4, col: 4, row_span: 2, col_span: 2 }
+    logs:
+      title: "Event Stream"
+      enabled: true
+      position: { row: 0, col: 0, row_span: 1, col_span: 1 }
+      max_rows: 500
+
+  candlestick:
+    available_intervals: ["1m", "5m", "15m", "1h", "4h", "1d"]
+    default_interval: "1m"
+
+  theme:
+    fonts:
+      ui: "Segoe UI"
+      mono: "Consolas"
+      size_sm: 11
+      size_md: 12
+      size_lg: 13
+      size_xl: 15
+      size_title: 18
+    surfaces:
+      l0: "#09090b"
+      l1: "#0e0e11"
+      l2: "#16161a"
+      l3: "#1d1d22"
+      l4: "#25252c"
+    borders:
+      subtle: "rgba(255,255,255,0.06)"
+      normal: "rgba(255,255,255,0.10)"
+      strong: "rgba(255,255,255,0.16)"
+    text:
+      primary: "#e4e4e7"
+      secondary: "#a1a1aa"
+      muted: "#71717a"
+      disabled: "#52525b"
+    accent:
+      main: "#38bdf8"
+      hover: "#0ea5e9"
+      active: "#0284c7"
+      subtle: "rgba(56,189,248,0.15)"
+    semantic:
+      up: "#10b981"
+      up_hover: "#059669"
+      up_active: "#047857"
+      down: "#ef4444"
+      down_hover: "#dc2626"
+      down_active: "#b91c1c"
+      warn: "#f59e0b"
+
+strategies:
+  active: "four_pattern"
+  subscribe_topic: "feed_depth"
+  cooldown_ms: 500
+  min_confidence: 0.5
+  strategy_timeframe: "1m"
+
+  # ─── TAPE READER ───
+  tape_reader:
+    min_rr: 1.0
+    atr_period: 14
+    time_stop_sec: 14400.0
+    tape_window_ms: 5000
+
+    # Base defaults (used if no per-symbol override)
+    sweep_threshold: 5.0
+    absorption_threshold: 10.0
+    price_stall_pct: 0.001
+
+    per_symbol:
+      BTC:
+        sweep_threshold: 5.0
+        absorption_threshold: 10.0
+        price_stall_pct: 0.001
+      XAUUSD:
+        sweep_threshold: 500.0
+        absorption_threshold: 1000.0
+        price_stall_pct: 0.0005
+
+  # ─── FOUR PATTERN ───
+  four_pattern:
+    # Base defaults (used as fallback when a symbol has no override)
+    atr_period: 14
+
+    k_wall: 3.0
+    t_wall_ms: 1000
+    d_min_wall: 5.00
+
+    k_test: 1.6
+    d_test_atr: 0.4
+    w_outcome_ms: 2500
+
+    b_break: 5.00
+    b_hold: 3.00
+
+    k_flip: 1.3
+    d_at_level_atr: 0.4
+    w_flip_ms: 6500
+
+    k_counter: 1.6
+    w_counter_ms: 4000
+    k_absorb: 1.3
+    d_max_drop: 0.50
+
+    d_major: 50.00
+    d_stop: 30.00
+
+    w_trig_ms: 2000
+    tape_spike_mult: 2.0
+    delta_one_sided: 0.60
+    t_entry_ms: 1500
+
+    b_exit: 8.00
+    b_wall: 8.00
+    d_min_profit: 30.00
+    cost_buffer: 15.00
+    t_max_ms: 360000
+
+    s_max_spread: 5.00
+    session_start_hour_utc: 0
+    session_end_hour_utc: 24
+    watch_timeout_ms: 120000
+    reassess_timeout_ms: 30000
+
+    per_symbol:
+      BTC:
+        d_min_wall: 100.00
+        b_break: 50.00
+        b_hold: 40.00
+        d_major: 500.00
+        d_stop: 200.00
+        d_min_profit: 300.00
+        cost_buffer: 100.00
+        b_exit: 80.00
+        b_wall: 80.00
+        s_max_spread: 30.00
+
+        k_test: 1.4
+        k_flip: 1.2
+        k_counter: 1.4
+        k_absorb: 1.2
+        tape_spike_mult: 1.8
+        delta_one_sided: 0.58
+        w_outcome_ms: 2000
+        w_flip_ms: 8000
+        w_counter_ms: 5000
+        w_trig_ms: 2500
+        t_entry_ms: 2000
+
+      XAUUSD:
+        d_min_wall: 0.50
+        b_break: 0.20
+        b_hold: 0.15
+        d_major: 5.00
+        d_stop: 3.00
+        d_min_profit: 1.00
+        cost_buffer: 0.60
+        b_exit: 0.30
+        b_wall: 0.30
+        s_max_spread: 0.50
+
+        k_test: 1.8
+        k_flip: 1.4
+        k_counter: 1.8
+        k_absorb: 1.4
+        tape_spike_mult: 2.5
+        delta_one_sided: 0.62
+        w_outcome_ms: 2500
+        w_flip_ms: 6500
+        w_counter_ms: 4000
+        w_trig_ms: 2000
+        t_entry_ms: 1500
+
+trade_journal:
+  enabled: true
+  path: "data/trade_journal.jsonl"
+  flush_interval_sec: 5.0
+  max_pending: 100
+
+execution:
+  broker: "mt5"
+  mt5:
+    enabled: true
+    terminal_path: null
+    login: null
+    password: null
+    server: null
+    magic: 202411
+    deviation_points: 10
+    filling_mode: "IOC"
+    order_timeout_ms: 5000
+    call_timeout_ms: 5000
+
+risk:
+  max_daily_loss_pct: 2.0
+  max_position_pct: 10.0
+  max_open_positions: 1
+  max_spread:
+    BTC: 50.0
+    XAUUSD: 0.50
+  no_pyramiding: true
+  no_martingale: true
+  cooldown_after_exit_sec: 5
+  cooldown_after_loss_sec: 60
+  max_signal_age_sec: 5
+  persist_state: true
+  daily_reset_hour_utc: 0
+  publish_interval_sec: 1
+  allow_manual_close: true
+  allow_manual_sl_tp: false
+
+protocol:
+  topics:
+    log_emit: "log_emit"
+    alert: "alert"
+    status_update: "status_update"
+    strategy_state: "strategy_state"
+    position_update: "position_update"
+    feed_depth: "feed_depth"
+    feed_kline: "feed_kline"
+    feed_trade: "feed_trade"
+    mt5_status: "mt5_status"
+    zones_update: "zones_update"
+    signal_proposed: "signal_proposed"
+    signal_approved: "signal_approved"
+    signal_rejected: "signal_rejected"
+    signal_new: "signal_new"
+    signal_failed: "signal_failed"
+    trade_closed: "trade_closed"
+    book_update: "book_update"
+    tape_append: "tape_append"
+    account_update: "account_update"
+    risk_state: "risk_state"
+    debug_decision: "debug.decision"
+    cmd_start_bot: "cmd_start_bot"
+    cmd_stop_bot: "cmd_stop_bot"
+    cmd_log_zones: "cmd_log_zones"
+    cmd_manual_close: "cmd_manual_close"
+    cmd_set_sltp: "cmd_set_sltp"
+    cmd_pause_feed: "cmd_pause_feed"
+    cmd_resume_feed: "cmd_resume_feed"
+    cmd_clear_risk_state: "cmd_clear_risk_state"
+    strategy_changed: "strategy_changed"
+    cmd_select_strategy: "cmd.select_strategy"
+    ui_symbol_changed: "ui_symbol_changed"

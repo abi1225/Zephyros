@@ -1,0 +1,25 @@
+symbols:
+  - id: BTC
+    display: "BTC/USD"
+    enabled: true
+    binance: BTCUSDT
+    mt5: "BTCUSDm"
+    price_decimals: 2
+    qty_decimals: 2
+    tick_size: 0.01
+    min_volume: 0.01
+    max_volume: 10.0
+    volume_step: 0.01
+
+  # GOLD is optional, but keeping it second ensures BTC is default
+  - id: GOLD
+    display: "XAU/USD"
+    enabled: false # Disabled to prevent API errors
+    binance: XAUUSDT
+    mt5: "XAUUSDm"
+    price_decimals: 2
+    qty_decimals: 2
+    tick_size: 0.01
+    min_volume: 0.01
+    max_volume: 10.0
+    volume_step: 0.01
