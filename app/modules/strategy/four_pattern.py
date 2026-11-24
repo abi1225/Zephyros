@@ -115,9 +115,6 @@ class FourPattern(Strategy):
         self._topic_feed_trade = config.protocol.topics.get(
             "feed_trade", "feed.trade"
         )
-        self._topic_feed_kline = config.protocol.topics.get(
-            "feed_kline", "feed.kline"
-        )
         self._topic_position = config.protocol.topics.get(
             "position_update", "position.update"
         )
@@ -129,9 +126,11 @@ class FourPattern(Strategy):
         )
 
         bus.subscribe(self._topic_feed_trade, self._on_trade)
-        bus.subscribe(self._topic_feed_kline, self._on_kline)
         bus.subscribe(self._topic_position, self._on_position)
         bus.subscribe(self._topic_signal_failed, self._on_signal_failed)
+        # NOTE: klines are delivered through StrategyManager.on_kline ->
+        # FourPattern.on_kline (single path). The strategy must NOT also
+        # subscribe to feed_kline, or every bar is processed twice.
 
     # ─── Params ────────────────────────────────────────────
 
@@ -220,7 +219,6 @@ class FourPattern(Strategy):
     def dispose(self) -> None:
         for topic, handler in (
             (self._topic_feed_trade, self._on_trade),
-            (self._topic_feed_kline, self._on_kline),
             (self._topic_position, self._on_position),
             (self._topic_signal_failed, self._on_signal_failed),
         ):
@@ -265,6 +263,15 @@ class FourPattern(Strategy):
                 timeframe,
             )
 
+    def warmup_timeframes(self, timeframe: str) -> list[str]:
+        """Intervals the manager must seed before START.
+
+        The entry engine needs 5m bars (pivots, ATR, regime) and the exit
+        engine needs 1m bars. Seeding only the UI timeframe leaves ATR at
+        zero, which disables every setup.
+        """
+        return ["5m", "1m"]
+
     def reset(self) -> None:
         self._reset_full()
 
@@ -301,26 +308,38 @@ class FourPattern(Strategy):
         # Book is not used for entry/exit in this design.
         return None
 
-    async def _on_kline(self, _topic: str, payload: dict) -> None:
-        symbol = payload.get("symbol")
+    async def on_kline(
+        self, symbol: str, payload: dict,
+    ) -> Signal | None:
+        """Single entry point for klines (live stream AND warmup).
+
+        StrategyManager feeds warmup history through here on START and
+        symbol switch, then live bars as they close. Exits are emitted
+        from the bus in `_evaluate_exit` instead, so this always returns
+        None.
+        """
         if not symbol or symbol != getattr(self, "_active_symbol", None):
-            return
+            return None
         interval = payload.get("interval")
         k = payload.get("kline")
         if not k or not k.get("closed"):
-            return
-        bar = Bar(
-            t=int(k["t"]),
-            o=float(k["o"]),
-            h=float(k["h"]),
-            l=float(k["l"]),
-            c=float(k["c"]),
-            v=float(k["v"]),
-        )
+            return None
+        try:
+            bar = Bar(
+                t=int(k["t"]),
+                o=float(k["o"]),
+                h=float(k["h"]),
+                l=float(k["l"]),
+                c=float(k["c"]),
+                v=float(k["v"]),
+            )
+        except (KeyError, TypeError, ValueError):
+            return None
         if interval == "5m":
             await self._handle_5m_bar(symbol, bar)
         elif interval == "1m":
             await self._handle_1m_bar(symbol, bar)
+        return None
 
     async def _handle_5m_bar(self, symbol: str, bar: Bar) -> None:
         buf = self._klines_5m.setdefault(symbol, deque(maxlen=200))
@@ -339,7 +358,11 @@ class FourPattern(Strategy):
         self._klines_1m.setdefault(symbol, deque(maxlen=500)).append(bar)
         await self._maybe_aggregate_5m(symbol, bar)
 
-        if self._state == "IN_TRADE":
+        # Never evaluate an exit before the entry has actually filled:
+        # doing so can emit CLOSE while the order is still in flight, the
+        # executor answers "no position", and the trade context is wiped
+        # while a real position lands unmanaged.
+        if self._state == "IN_TRADE" and not self._entry_pending:
             await self._evaluate_exit(symbol)
 
     async def _maybe_aggregate_5m(self, symbol: str, bar_1m: Bar) -> None:
@@ -724,14 +747,18 @@ class FourPattern(Strategy):
             else:
                 details["cvd_confirms"] = short_slope < 0
 
-        # CVD divergence (last 10 × 5m bars)
+        # CVD divergence (last 10 × 5m bars).
+        # Entry confirmation wants the divergence that SUPPORTS the trade:
+        # a long entry is supported by bullish divergence (absorption at
+        # the lows), a short by bearish divergence at the highs.
         cvd_series = compute_cvd_series(
             trades, 10 * _FIVE_MIN_MS,
             bar.t + _FIVE_MIN_MS, buckets=10,
         )
         if len(cvd_series) >= 3:
             details["cvd_divergence"] = detect_cvd_divergence(
-                bars_5m[-10:], cvd_series, direction,
+                bars_5m[-10:], cvd_series,
+                "bullish" if direction == "BUY" else "bearish",
             )
 
         # RVOL
@@ -1021,6 +1048,9 @@ class FourPattern(Strategy):
                     "FOUR_PATTERN BE @ %.4f | stop=%.4f",
                     t.entry_price, t.stop_price,
                 )
+                # Broker-side protection must follow the in-memory stop,
+                # otherwise a crash reverts us to the original wide stop.
+                await self._publish_stop_sync(symbol, t.stop_price, "breakeven")
 
         # Layer 5: exhaustion exit (only after BE)
         if self.enable_exhaustion_exit and t.be_triggered:
@@ -1111,14 +1141,17 @@ class FourPattern(Strategy):
                     deltas[-1] > deltas[-2] > deltas[-3]
                 )
 
-        # CVD divergence over last 6 × 1m
+        # CVD divergence over last 6 × 1m.
+        # An exhaustion exit wants the divergence OPPOSING the open trade:
+        # a long is exhausted by bearish divergence at the highs.
         cvd_series = compute_cvd_series(
             trades, 6 * _ONE_MIN_MS,
             bar.t + _ONE_MIN_MS, buckets=6,
         )
         if len(cvd_series) >= 3:
             details["cvd_divergence"] = detect_cvd_divergence(
-                bars_1m[-6:], cvd_series, direction,
+                bars_1m[-6:], cvd_series,
+                "bearish" if direction == "BUY" else "bullish",
             )
 
         # Follow-through failure: returned to pivot
@@ -1131,6 +1164,17 @@ class FourPattern(Strategy):
 
         count = sum(1 for v in details.values() if v)
         return count, details
+
+    async def _publish_stop_sync(
+        self, symbol: str, stop: float, reason: str,
+    ) -> None:
+        try:
+            await bus.publish(
+                config.protocol.topics.get("cmd_sync_stop", "cmd_sync_stop"),
+                {"symbol": symbol, "stop": float(stop), "reason": reason},
+            )
+        except Exception:
+            log.exception("Failed to publish stop sync for %s", symbol)
 
     def _close(
         self, symbol: str, reason: str, exit_price: float,

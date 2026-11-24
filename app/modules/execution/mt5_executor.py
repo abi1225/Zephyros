@@ -91,6 +91,10 @@ class MT5Executor(BaseModule):
         bus.subscribe(config.protocol.topics["cmd_start_bot"], self._on_start_cmd)
         bus.subscribe(config.protocol.topics["cmd_manual_close"], self._on_manual_close)
         bus.subscribe(config.protocol.topics["cmd_set_sltp"], self._on_set_sltp)
+        bus.subscribe(
+            config.protocol.topics.get("cmd_sync_stop", "cmd_sync_stop"),
+            self._on_sync_stop,
+        )
         bus.subscribe(config.protocol.topics["feed_trade"], self._on_feed_trade)
 
         try:
@@ -167,16 +171,43 @@ class MT5Executor(BaseModule):
         )
         return True
 
-    async def _run_blocking(self, fn, *args, **kwargs):
+    async def _run_blocking(self, fn, *args, timeout: float | None = None,
+                            **kwargs):
+        """Run a blocking MT5 call off-loop with a hard timeout.
+
+        Every MT5 call shares a single worker thread. Without a timeout a
+        hung call (dead terminal, dropped IPC) blocks the PnL poller, the
+        account poller and every subsequent order, so the bot silently
+        stops managing open positions.
+        """
         if self._loop is None or self._executor is None:
             return None
+        if timeout is None:
+            timeout = max(int(config.execution.mt5.call_timeout_ms), 1000) / 1000.0
+
         if not kwargs:
-            return await self._loop.run_in_executor(self._executor, fn, *args)
+            fut = self._loop.run_in_executor(self._executor, fn, *args)
+        else:
+            def _call():
+                return fn(*args, **kwargs)
+            fut = self._loop.run_in_executor(self._executor, _call)
 
-        def _call():
-            return fn(*args, **kwargs)
+        try:
+            return await asyncio.wait_for(asyncio.shield(fut), timeout=timeout)
+        except asyncio.TimeoutError:
+            log.error(
+                "MT5 call %s timed out after %.1fs (worker thread may be stuck)",
+                getattr(fn, "__name__", fn), timeout,
+            )
+            return None
 
-        return await self._loop.run_in_executor(self._executor, _call)
+    async def _send_order(self, request: dict, timeout: float | None = None):
+        """order_send with the configured order timeout."""
+        if timeout is None:
+            timeout = max(int(config.execution.mt5.order_timeout_ms), 1000) / 1000.0
+        return await self._run_blocking(
+            mt5.order_send, timeout=timeout, **request,
+        )
 
     async def _validate_symbol_mappings(self) -> None:
         enabled = registry.enabled()
@@ -589,6 +620,20 @@ class MT5Executor(BaseModule):
             },
         )
 
+    async def _on_sync_stop(self, _topic: str, payload: dict) -> None:
+        """Strategy-driven stop update (break-even / trailing)."""
+        if not self._connected:
+            return
+        symbol = str((payload or {}).get("symbol", ""))
+        if not symbol:
+            return
+        try:
+            new_stop = float(payload.get("stop") or 0.0)
+        except (TypeError, ValueError):
+            return
+        reason = str(payload.get("reason") or "trail")
+        await self.sync_stop(symbol, new_stop, reason)
+
     async def _on_signal(self, _topic: str, signal_dict: dict) -> None:
         log.info(
             f"[PIPELINE 3→4] Executor received: "
@@ -661,7 +706,10 @@ class MT5Executor(BaseModule):
         for name in ("IOC", "FOK", "RETURN"):
             if name not in order:
                 order.append(name)
-        bit_for = {"FOK": 1, "IOC": 2, "RETURN": 4}
+        # MQL5 SYMBOL_FILLING_* constants: FOK=1, IOC=2, BOC=4, RETURN=8.
+        # RETURN is bit 8, not 4 — matching bit 4 flagged RETURN as
+        # supported on brokers that actually only allow BOC.
+        bit_for = {"FOK": 1, "IOC": 2, "RETURN": 8}
         chosen_name = "IOC"
         for name in order:
             if allowed_mask & bit_for.get(name, 0):
@@ -670,6 +718,74 @@ class MT5Executor(BaseModule):
         chosen = int(_FILLING_CONST[chosen_name])
         self._filling_cache[broker_symbol] = chosen
         return chosen
+
+    async def _resolve_position_ticket(
+        self, result: Any, broker_symbol: str, magic: int,
+    ) -> tuple[int | None, float | None]:
+        """Resolve the real POSITION ticket after a market order fills.
+
+        `result.order` is the order ticket, not the position ticket. Using
+        it as the position id makes close requests fail and makes the PnL
+        poller think the position vanished immediately.
+
+        Strategy: read the order's deals -> take the entry deal's
+        position_id -> confirm against positions_get(ticket=...).
+        """
+        order_ticket = int(getattr(result, "order", 0) or 0)
+        deal_ticket = int(getattr(result, "deal", 0) or 0)
+        fill_price = getattr(result, "price", None)
+
+        position_id: int | None = None
+        try:
+            deals = await self._run_blocking(
+                mt5.history_deals_get, ticket=deal_ticket,
+            ) or []
+            for d in deals:
+                pid = int(getattr(d, "position_id", 0) or 0)
+                if pid > 0:
+                    position_id = pid
+                    if not fill_price:
+                        fill_price = float(getattr(d, "price", 0.0) or 0.0)
+                    break
+        except Exception:
+            log.exception("Failed to resolve position id from deal %s", deal_ticket)
+        fallback_price = fill_price
+
+        # Verify against the live position list; this also covers brokers
+        # that do not populate position_id on the entry deal.
+        try:
+            positions = await self._run_blocking(mt5.positions_get) or []
+        except Exception:
+            positions = []
+
+        for p in positions:
+            p_magic = int(getattr(p, "magic", 0) or 0)
+            if int(getattr(p, "ticket", 0) or 0) == order_ticket:
+                return int(p.ticket), fallback_price
+            if position_id is not None and int(p.ticket) == position_id:
+                if fallback_price is None:
+                    fallback_price = float(getattr(p, "price_open", 0.0) or 0.0)
+                return int(p.ticket), fallback_price
+
+        # No match by id: pick the newest position on this symbol with our
+        # magic, rather than guessing from the order ticket.
+        candidates = [
+            p for p in positions
+            if str(getattr(p, "symbol", "")) == broker_symbol
+            and int(getattr(p, "magic", 0) or 0) == magic
+        ]
+        if candidates:
+            newest = max(candidates, key=lambda p: int(getattr(p, "time", 0)))
+            if fallback_price is None:
+                fallback_price = float(getattr(newest, "price_open", 0.0) or 0.0)
+            log.warning(
+                "Position id unresolved from deal %s — matched newest %s "
+                "position ticket=%s on %s",
+                deal_ticket, broker_symbol, newest.ticket, broker_symbol,
+            )
+            return int(newest.ticket), fallback_price
+
+        return None, fallback_price
 
     def _compute_volume(self, sig: Signal) -> float:
         metadata = sig.metadata or {}
@@ -767,14 +883,17 @@ class MT5Executor(BaseModule):
             f"price={request['price']} sl={request['sl']}"
         )
 
-        result = await self._run_blocking(mt5.order_send, **request)
+        result = await self._send_order(request)
         if result is None:
             err = await self._run_blocking(mt5.last_error)
             await self._log(f"order_send returned None: {err}", level="error")
             await self._publish_signal_failed(sig, f"order_send None: {err}")
             return
 
-        if result.retcode != mt5.TRADE_RETCODE_DONE:
+        done_codes = {mt5.TRADE_RETCODE_DONE}
+        if hasattr(mt5, "TRADE_RETCODE_DONE_PARTIAL"):
+            done_codes.add(mt5.TRADE_RETCODE_DONE_PARTIAL)
+        if result.retcode not in done_codes:
             await self._log(
                 f"Order rejected: retcode={result.retcode} comment={result.comment}",
                 level="error",
@@ -784,22 +903,47 @@ class MT5Executor(BaseModule):
             )
             return
 
+        # IMPORTANT: result.order is an ORDER ticket; the position has its
+        # own ticket. Resolve the real one or every later close/poll fails.
+        magic = int(config.execution.mt5.magic)
+        position_ticket, fill_price = await self._resolve_position_ticket(
+            result, broker_symbol, magic,
+        )
+        filled_volume = float(getattr(result, "volume", 0.0) or volume)
+        if result.retcode != mt5.TRADE_RETCODE_DONE:
+            await self._log(
+                f"Partial fill on {broker_symbol}: "
+                f"{filled_volume}/{volume} @ {fill_price}",
+                level="warn",
+            )
+        if position_ticket is None:
+            await self._log(
+                f"Order filled but position ticket unresolved for "
+                f"{broker_symbol} (order={getattr(result, 'order', None)}) — "
+                f"leaving it to reconciliation; no local tracking.",
+                level="error",
+            )
+            await self._publish_signal_failed(sig, "position ticket unresolved")
+            return
+
+        fill_price = float(fill_price or price)
+
         self._positions[sig.symbol] = {
-            "ticket": int(result.order), "side": sig.action,
-            "volume": float(volume), "entry": float(result.price or price),
+            "ticket": int(position_ticket), "side": sig.action,
+            "volume": filled_volume, "entry": fill_price,
             "opened_at": int(time.time() * 1000),
-            "sl": float(mt5_stop), "tp": 0.0,
+            "sl": float(mt5_stop), "tp": 0.0, "original_sl": float(mt5_stop),
             "pnl": 0.0, "swap": 0.0, "commission": 0.0,
-            "current_price": float(result.price or price),
+            "current_price": fill_price,
             "scenario": scenario, "size_mult": size_mult,
             "vol_source": vol_source,
         }
 
         try:
             self._db.open_trade(
-                signal_id=sig.id, entry_order_id=int(result.order),
+                signal_id=sig.id, entry_order_id=int(position_ticket),
                 symbol=sig.symbol, broker_symbol=broker_symbol, side=sig.action,
-                volume=float(volume), entry_price=float(result.price or price),
+                volume=filled_volume, entry_price=fill_price,
                 entry_ts=int(time.time() * 1000), strategy=sig.strategy,
                 status="open", entry_plan=entry_plan or None,
             )
@@ -807,8 +951,9 @@ class MT5Executor(BaseModule):
             log.warning("DB open_trade failed: %s", exc)
 
         await self._log(
-            f"Filled {sig.action} {broker_symbol} vol={volume:.2f} "
-            f"[{scenario} {vol_source}] @ {result.price} (Naked Entry)"
+            f"Filled {sig.action} {broker_symbol} vol={filled_volume:.2f} "
+            f"[{scenario} {vol_source}] @ {fill_price} "
+            f"(position={position_ticket})"
         )
         await bus.publish(
             config.protocol.topics["position_update"],
@@ -820,15 +965,86 @@ class MT5Executor(BaseModule):
             },
         )
 
+    async def sync_stop(
+        self, symbol: str, new_stop: float, reason: str = "trail",
+    ) -> bool:
+        """Push an updated stop loss to the broker for an open position.
+
+        Strategies manage break-even and trailing stops in memory, but
+        broker-side protection only changes if we send TRADE_ACTION_SLTP.
+        Without this a crash leaves the original wide stop attached.
+        """
+        if not self._connected or new_stop <= 0:
+            return False
+        pos = self._positions.get(symbol)
+        if pos is None:
+            return False
+        current = float(pos.get("sl") or 0.0)
+        side = pos.get("side")
+        # Stops are monotonic: only ever tighten.
+        if side == "BUY" and new_stop <= current:
+            return False
+        if side == "SELL" and current > 0 and new_stop >= current:
+            return False
+
+        sym = registry.get(symbol)
+        if sym is None or not sym.mt5:
+            return False
+
+        request = {
+            "action": int(mt5.TRADE_ACTION_SLTP),
+            "symbol": str(sym.mt5),
+            "position": int(pos["ticket"]),
+            "sl": float(new_stop),
+            "tp": float(pos.get("tp") or 0.0),
+        }
+        result = await self._send_order(request)
+        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+            code = getattr(result, "retcode", "None")
+            await self._log(
+                f"Stop sync rejected for {symbol} ({reason}): "
+                f"sl={new_stop:.4f} retcode={code}",
+                level="warn",
+            )
+            return False
+
+        pos["sl"] = float(new_stop)
+        await self._log(
+            f"Stop synced {symbol} ({reason}) → {new_stop:.4f}"
+        )
+        await bus.publish(
+            config.protocol.topics["position_update"],
+            {
+                "symbol": symbol, "position": dict(pos),
+                "ts": int(time.time() * 1000), "source": "sl_sync",
+            },
+        )
+        return True
+
     async def _handle_close(self, sig: Signal, broker_symbol: str) -> None:
         pos = self._positions.get(sig.symbol)
         if pos is None:
-            positions = await self._run_blocking(mt5.positions_get, symbol=broker_symbol)
-            if not positions:
-                await self._log(f"CLOSE for {sig.symbol} but no open position", level="warn")
-                await self._publish_signal_failed(sig, "close requested but no position found")
+            # Only ever consider OUR positions: positions_get(symbol=...)
+            # returns manual and other-EA trades on the same symbol too.
+            magic = int(config.execution.mt5.magic)
+            positions = await self._run_blocking(
+                mt5.positions_get, symbol=broker_symbol,
+            ) or []
+            ours = [
+                p for p in positions
+                if int(getattr(p, "magic", 0) or 0) == magic
+            ]
+            if not ours:
+                await self._log(
+                    f"CLOSE for {sig.symbol} but no open position with "
+                    f"magic={magic}",
+                    level="warn",
+                )
+                await self._publish_signal_failed(
+                    sig, "close requested but no position found",
+                )
                 return
-            p = positions[0]
+            p = max(ours, key=lambda p: int(getattr(p, "time", 0)))
             pos = {
                 "ticket": int(p.ticket),
                 "side": "BUY" if p.type == mt5.POSITION_TYPE_BUY else "SELL",
@@ -875,12 +1091,15 @@ class MT5Executor(BaseModule):
                 "type_filling": filling,
             }
 
-            result = await self._run_blocking(mt5.order_send, **request)
+            result = await self._send_order(request)
             if result is None:
                 err = await self._run_blocking(mt5.last_error)
                 await self._log(f"close order_send None: {err}", level="error")
                 return
-            if result.retcode != mt5.TRADE_RETCODE_DONE:
+            done_codes = {mt5.TRADE_RETCODE_DONE}
+            if hasattr(mt5, "TRADE_RETCODE_DONE_PARTIAL"):
+                done_codes.add(mt5.TRADE_RETCODE_DONE_PARTIAL)
+            if result.retcode not in done_codes:
                 await self._log(
                     f"Close rejected: retcode={result.retcode} comment={result.comment}",
                     level="error",

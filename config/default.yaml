@@ -63,6 +63,8 @@ symbols:
     min_volume: 0.01
     max_volume: 100.0
     volume_step: 0.01
+    # 1 lot = 100 oz; converted to exposure by the risk notional cap.
+    contract_size: 100.0
 
 feeds:
   binance:

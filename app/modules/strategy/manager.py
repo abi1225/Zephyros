@@ -165,6 +165,57 @@ class StrategyManager(BaseModule):
 
     # ─── Symbol change handler ─────────────────────────────
 
+    async def _warmup_klines(self, symbol: str, timeframe: str) -> None:
+        """Seed the strategy with history for START and symbol switch.
+
+        `timeframe` is what the UI is showing, but a strategy may need
+        other intervals internally (FourPattern enters on 5m and exits on
+        1m). `warmup_timeframes()` lets the strategy declare them; without
+        it the strategy would only ever see 1m bars, ATR would stay at 0
+        and no setup could ever be validated.
+        """
+        tf_fn = getattr(self._strategy, "warmup_timeframes", None)
+        try:
+            timeframes = list(tf_fn(timeframe)) if callable(tf_fn) else [timeframe]
+        except Exception:
+            log.exception("warmup_timeframes() failed; using %r", timeframe)
+            timeframes = [timeframe]
+        if timeframe not in timeframes:
+            timeframes.append(timeframe)
+
+        for tf in timeframes:
+            try:
+                klines = await asyncio.wait_for(
+                    kline_router.fetch(symbol, tf, limit=300),
+                    timeout=10.0,
+                )
+            except asyncio.TimeoutError:
+                log.warning("Kline warmup (%s) timed out for %s", tf, symbol)
+                continue
+            except Exception:
+                log.exception("Kline warmup (%s) failed for %s", tf, symbol)
+                continue
+
+            used = 0
+            for kp in klines:
+                try:
+                    await self._strategy.on_kline(symbol, kp)
+                    used += 1
+                except Exception:
+                    log.exception(
+                        "Warmup bar rejected for %s %s", symbol, tf,
+                    )
+            log.info(
+                "Warmup %s %s: %d/%d bars seeded",
+                symbol, tf, used, len(klines),
+            )
+            if not klines:
+                log.warning(
+                    "No historical %s klines for %s — strategy will warm "
+                    "from the live stream only (several bars of delay).",
+                    tf, symbol,
+                )
+
     async def _on_symbol_changed(self, _topic: str, payload: dict) -> None:
         new_symbol = str((payload or {}).get("symbol", "")).strip()
         if not new_symbol or not self._running or self._strategy is None:
@@ -192,23 +243,7 @@ class StrategyManager(BaseModule):
         self._strategy.set_timeframe(self._timeframe)
         self._symbol = new_symbol
 
-        try:
-            klines = await asyncio.wait_for(
-                kline_router.fetch(new_symbol, self._timeframe, limit=100),
-                timeout=10.0,
-            )
-        except asyncio.TimeoutError:
-            log.warning("Kline warmup timed out for %s after switch", new_symbol)
-            klines = []
-        except Exception:
-            log.exception("Kline warmup failed for %s after switch", new_symbol)
-            klines = []
-
-        for kp in klines:
-            try:
-                await self._strategy.on_kline(new_symbol, kp)
-            except Exception:
-                pass
+        await self._warmup_klines(new_symbol, self._timeframe)
 
         await bus.publish(config.protocol.topics["strategy_state"], {
             "warming": False, "running": True, "ready": True,
@@ -254,30 +289,13 @@ class StrategyManager(BaseModule):
                 "StrategyManager: using %d OVERRIDE klines for %s",
                 len(klines), symbol,
             )
+            for kp in klines:
+                try:
+                    await self._strategy.on_kline(symbol, kp)
+                except Exception:
+                    log.exception("Override warmup bar rejected for %s", symbol)
         else:
-            try:
-                klines = await asyncio.wait_for(
-                    kline_router.fetch(symbol, timeframe, limit=100),
-                    timeout=10.0,
-                )
-            except asyncio.TimeoutError:
-                log.warning("Kline fetch timed out during START")
-                klines = []
-            except Exception:
-                log.exception("Kline fetch failed during START")
-                klines = []
-
-        if not klines:
-            log.warning(
-                "No historical klines for %s — will warm up from live stream.",
-                symbol,
-            )
-
-        for kp in klines:
-            try:
-                await self._strategy.on_kline(symbol, kp)
-            except Exception:
-                pass
+            await self._warmup_klines(symbol, str(timeframe))
 
         self._running = True
         self._symbol = symbol

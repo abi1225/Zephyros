@@ -13,6 +13,7 @@ from app.core.config import config
 from app.core.database import get_db
 from app.core.event_bus import bus
 from app.core.module import BaseModule
+from app.core.symbols import registry
 
 log = logging.getLogger(__name__)
 
@@ -77,11 +78,20 @@ class RiskManager(BaseModule):
         self._db = get_db()
         self._state_path = Path(config.app.risk_state_path)
         self._running = False
+        self._best: dict[str, tuple[float, float]] = {}
+        self._pnl_task: asyncio.Task | None = None
+        # Lot size the ribbon asked for; mirrors MT5Executor's default so
+        # the notional cap can be evaluated before a signal is executed.
+        self._default_volume: float = 0.01
 
     async def start(self) -> None:
         self._running = True
         self._load_state()
         self._roll_day_if_needed()
+        if self._state.day == self._current_day():
+            # Fresh boot on the same day: the in-memory counter may be
+            # stale or empty, so reconcile against the trade database.
+            self._restore_day_from_db()
 
         bus.subscribe(config.protocol.topics["signal_proposed"], self._on_proposed)
         bus.subscribe(config.protocol.topics["position_update"], self._on_position)
@@ -94,6 +104,14 @@ class RiskManager(BaseModule):
             config.protocol.topics.get("cmd_clear_risk_state", "cmd_clear_risk_state"),
             self._on_clear_state,
         )
+        bus.subscribe(
+            config.protocol.topics.get("book_update", "book_update"),
+            self._on_book,
+        )
+        bus.subscribe(
+            config.protocol.topics.get("cmd_start_bot", "cmd_start_bot"),
+            self._on_start_cmd,
+        )
 
         asyncio.create_task(self._publish_loop())
 
@@ -104,6 +122,31 @@ class RiskManager(BaseModule):
             f"equity={self._state.starting_equity:.2f} "
             f"halted={self._state.trading_halted}"
         )
+
+    async def _on_start_cmd(self, _topic: str, payload: dict) -> None:
+        """Track the lot size chosen in the ribbon for the notional cap."""
+        values = (payload or {}).get("values") or {}
+        vol = values.get("volume")
+        if vol is not None:
+            try:
+                v = float(vol)
+                if v > 0:
+                    self._default_volume = v
+            except (TypeError, ValueError):
+                pass
+
+    async def _on_book(self, _topic: str, payload: dict) -> None:
+        """Track best bid/ask for the live spread gate."""
+        symbol = payload.get("symbol")
+        data = payload.get("data") or {}
+        bids = data.get("bids") or []
+        asks = data.get("asks") or []
+        if not symbol or not bids or not asks:
+            return
+        try:
+            self._best[symbol] = (float(bids[0][0]), float(asks[0][0]))
+        except (TypeError, ValueError, IndexError):
+            return
 
     async def stop(self) -> None:
         self._running = False
@@ -127,17 +170,37 @@ class RiskManager(BaseModule):
         )
 
     async def _on_account(self, _topic: str, payload: dict) -> None:
-        if self._state.starting_equity > 0:
-            return
         try:
             equity = float(payload.get("equity") or 0.0)
         except (TypeError, ValueError):
             return
         if equity <= 0:
             return
-        self._state.starting_equity = equity
-        self._save_state()
-        await self._log(f"Captured starting equity: {equity:.2f}")
+
+        if self._state.starting_equity <= 0:
+            self._state.starting_equity = equity
+            self._save_state()
+            await self._log(f"Captured starting equity: {equity:.2f}")
+            return
+
+        # Equity-based halt: an open drawdown must count too, not just
+        # trades that have already been closed.
+        if self._state.trading_halted:
+            return
+        drawdown_pct = (
+            (self._state.starting_equity - equity)
+            / self._state.starting_equity * 100.0
+        )
+        if drawdown_pct >= config.risk.max_daily_loss_pct:
+            self._state.trading_halted = True
+            self._state.halt_reason = (
+                f"equity drawdown {drawdown_pct:.2f}% >= "
+                f"{config.risk.max_daily_loss_pct}%"
+            )
+            self._save_state()
+            await self._log(
+                f"TRADING HALTED — {self._state.halt_reason}", level="error",
+            )
 
     def _load_state(self) -> None:
         if not config.risk.persist_state:
@@ -166,6 +229,32 @@ class RiskManager(BaseModule):
         except Exception as exc:
             log.warning("Failed to save risk state: %s", exc)
 
+    def _signal_volume(self, metadata: dict) -> float:
+        """Best estimate of the volume this signal will trade.
+
+        Only `volume_override` is unambiguous here. The executor's default
+        lot size is not visible to the risk manager, so a signal without an
+        explicit override returns 0.0 and skips the notional check rather
+        than guessing a size it does not know.
+        """
+        try:
+            override = metadata.get("volume_override")
+            if override is not None:
+                return max(float(override), 0.0)
+        except (TypeError, ValueError):
+            pass
+        return 0.0
+
+    def _contract_size(self, symbol: str) -> float:
+        """Units per 1.0 lot, used to convert volume to exposure."""
+        sym = registry.get(symbol)
+        if sym is None:
+            return 1.0
+        try:
+            return float(getattr(sym, "contract_size", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            return 1.0
+
     def _current_day(self) -> str:
         reset_hour = int(config.risk.daily_reset_hour_utc) % 24
         now_utc = datetime.now(timezone.utc)
@@ -185,7 +274,43 @@ class RiskManager(BaseModule):
         self._state.daily_losses = 0
         self._state.trading_halted = False
         self._state.halt_reason = ""
+        self._restore_day_from_db()
         self._save_state()
+
+    def _day_start_ms(self) -> int:
+        reset_hour = int(config.risk.daily_reset_hour_utc) % 24
+        now_utc = datetime.now(timezone.utc)
+        start = now_utc.replace(
+            hour=reset_hour, minute=0, second=0, microsecond=0,
+        )
+        if start > now_utc:
+            start -= timedelta(days=1)
+        return int(start.timestamp() * 1000)
+
+    def _restore_day_from_db(self) -> None:
+        """Rebuild today's realised PnL from closed trades.
+
+        Without this a restart mid-drawdown resets the daily loss counter
+        and the cap can be sidestepped by relaunching the app.
+        """
+        try:
+            since = self._day_start_ms()
+            pnl = self._db.realized_pnl_since(since)
+            counts = self._db.trade_counts_since(since)
+        except Exception as exc:
+            log.warning("Risk state restore from DB failed: %s", exc)
+            return
+        self._state.daily_realized_pnl = float(pnl)
+        self._state.daily_trades = int(counts.get("total", 0))
+        self._state.daily_wins = int(counts.get("wins", 0))
+        self._state.daily_losses = int(counts.get("losses", 0))
+        log.info(
+            "Risk state restored from DB: pnl=%+.2f trades=%d (%dW/%dL)",
+            self._state.daily_realized_pnl,
+            self._state.daily_trades,
+            self._state.daily_wins,
+            self._state.daily_losses,
+        )
 
     async def _on_proposed(self, _topic: str, payload: dict) -> None:
         log.info(f"[PIPELINE 2→3] Risk manager received: {payload.get('action')} {payload.get('symbol')}")
@@ -248,9 +373,6 @@ class RiskManager(BaseModule):
         if action not in ("BUY", "SELL"):
             return RiskDecision(approved=True)
 
-        if metadata.get("bypass_risk"):
-            return RiskDecision(approved=True)
-
         if self._state.trading_halted:
             return RiskDecision(
                 approved=False,
@@ -274,6 +396,46 @@ class RiskManager(BaseModule):
             )
 
         now_ms = int(time.time() * 1000)
+
+        # ─── Spread gate ───
+        max_spread = config.risk.max_spread.get(symbol)
+        if max_spread is not None:
+            best = self._best.get(symbol)
+            if best is None:
+                return RiskDecision(
+                    approved=False,
+                    reason=f"no live book for {symbol} (spread unknown)",
+                )
+            bid, ask = best
+            spread = ask - bid
+            if spread > float(max_spread):
+                return RiskDecision(
+                    approved=False,
+                    reason=f"spread {spread:.4f} > max {float(max_spread):.4f}",
+                )
+
+        # ─── Notional / position-size cap ───
+        best = self._best.get(symbol)
+        price = ((best[0] + best[1]) / 2.0) if best else 0.0
+        if price > 0 and self._state.starting_equity > 0:
+            volume = self._signal_volume(metadata) or self._default_volume
+            if volume > 0:
+                cap = (
+                    float(config.risk.max_position_pct) / 100.0
+                    * self._state.starting_equity
+                )
+                # BTC-style contracts are already notional; forex/gold lots
+                # are quoted per 100k units, so scale by contract_size.
+                exposure = volume * price * self._contract_size(symbol)
+                if cap > 0 and exposure > cap:
+                    return RiskDecision(
+                        approved=False,
+                        reason=(
+                            f"position size {volume} ≈ {exposure:,.0f} "
+                            f"exceeds {config.risk.max_position_pct:.1f}% "
+                            f"of equity ({cap:,.0f})"
+                        ),
+                    )
 
         last_close = self._state.last_close_ts.get(symbol, 0)
         if last_close:

@@ -1,0 +1,17 @@
+{
+  "day": "2026-11-24",
+  "starting_equity": 172.3,
+  "daily_realized_pnl": 0.0,
+  "daily_trades": 0,
+  "daily_wins": 0,
+  "daily_losses": 0,
+  "trading_halted": false,
+  "halt_reason": "",
+  "open_positions": {},
+  "last_close_ts": {
+    "BTC": 1795172561705
+  },
+  "last_loss_ts": {
+    "BTC": 1795172561705
+  }
+}

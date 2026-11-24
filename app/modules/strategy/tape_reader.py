@@ -65,6 +65,7 @@ class TapeReader(Strategy):
         self._target_price = 0.0
         self._sar_active = False
         self._tf_fallback_warned = False
+        self._last_stop_sync: dict[str, float] = {}
 
         self._klines: dict[str, deque] = {}
         self._atr_history: dict[str, deque] = {}
@@ -576,6 +577,8 @@ class TapeReader(Strategy):
                     return self._close(
                         symbol, f"sar_trail {sar:.4f}", price,
                     )
+                # Keep the broker-side stop in step with the SAR trail.
+                self._publish_stop_sync(symbol, sar, "sar_trail")
 
         if is_long and price >= self._target_price:
             return self._close(symbol, "target", price)
@@ -586,6 +589,27 @@ class TapeReader(Strategy):
             return self._close(symbol, "time_stop", price)
 
         return None
+
+    def _publish_stop_sync(
+        self, symbol: str, stop: float, reason: str,
+    ) -> None:
+        """Fire-and-forget broker stop update (callers are sync).
+
+        Throttled: only publishes when the stop has moved a meaningful
+        distance, so a fast tape cannot flood the event bus.
+        """
+        if stop <= 0:
+            return
+        last = self._last_stop_sync.get(symbol, 0.0)
+        if last > 0 and abs(stop - last) < max(last * 1e-5, 1e-8):
+            return
+        self._last_stop_sync[symbol] = stop
+        asyncio.create_task(
+            bus.publish(
+                config.protocol.topics.get("cmd_sync_stop", "cmd_sync_stop"),
+                {"symbol": symbol, "stop": float(stop), "reason": reason},
+            )
+        )
 
     def _close(
         self, symbol: str, reason: str, exit_price: float,

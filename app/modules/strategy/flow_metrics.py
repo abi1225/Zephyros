@@ -112,17 +112,24 @@ def compute_cvd_slope(series: list[float]) -> float:
 def detect_cvd_divergence(
     bars: Sequence[Bar],
     cvd_series: list[float],
-    direction: str,
+    kind: str,
 ) -> bool:
-    """Price new extreme, CVD fails to confirm.
+    """Price makes a new extreme, CVD fails to confirm it.
 
-    direction == "BUY" → check for bearish divergence at a price high
-      (price higher high, CVD lower high) — signals exhaustion of uptrend.
-    direction == "SELL" → check for bullish divergence at a price low.
+    `kind` is the divergence being looked for, *not* the trade direction:
+
+      kind == "bullish" → price lower low, CVD higher low.
+        Sellers are being absorbed at the low; supports a long reversal.
+      kind == "bearish" → price higher high, CVD lower high.
+        Buyers are being absorbed at the high; supports a short reversal.
+
+    Callers must pick `kind` explicitly: an entry confirmation wants the
+    divergence that *supports* the entry, while an exhaustion exit wants
+    the divergence that *opposes* the open trade.
     """
     if len(bars) < 3 or len(cvd_series) < 3:
         return False
-    if direction == "BUY":
+    if kind == "bearish":
         recent_high = max(b.h for b in bars[-2:])
         prior_high = max(b.h for b in bars[:-2])
         if recent_high <= prior_high:
@@ -130,6 +137,8 @@ def detect_cvd_divergence(
         recent_cvd = max(cvd_series[-2:])
         prior_cvd = max(cvd_series[:-2])
         return recent_cvd < prior_cvd
+    if kind != "bullish":
+        return False
     recent_low = min(b.l for b in bars[-2:])
     prior_low = min(b.l for b in bars[:-2])
     if recent_low >= prior_low:

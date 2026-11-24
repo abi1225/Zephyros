@@ -83,6 +83,8 @@ class SymbolCfg(BaseModel):
     min_volume: float | None = None
     max_volume: float | None = None
     volume_step: float | None = None
+    # Units per 1.0 lot, used to convert volume into account exposure.
+    contract_size: float = 1.0
 
 
 # ─── Feeds ──────────────────────────────────────────────────
@@ -372,6 +374,7 @@ _TOPIC_DEFAULTS: dict[str, str] = {
     "cmd_log_zones": "cmd_log_zones",
     "cmd_manual_close": "cmd_manual_close",
     "cmd_set_sltp": "cmd_set_sltp",
+    "cmd_sync_stop": "cmd_sync_stop",
     "cmd_pause_feed": "cmd_pause_feed",
     "cmd_resume_feed": "cmd_resume_feed",
     "cmd_clear_risk_state": "cmd_clear_risk_state",
